@@ -1,3 +1,21 @@
+"""Standalone PyTorch mirror of FlashInfer's SM120 CP GDN implementation.
+
+FlashInfer source correspondence:
+
+* Public adapter:
+  ``flashinfer/gdn_prefill.py::chunk_gated_delta_rule``
+* Complete SM120 CP pipeline:
+  ``flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_cp_sm120.py::
+  cp_delta_rule_dsl_sm120``
+* Varlen workspace/chunk helpers:
+  ``flashinfer/gdn_kernels/delta_rule_dsl/varlen_helper.py``
+
+This module preserves the algorithm, packed-varlen indexing, 64-token blocks,
+and public tensor layouts. It replaces CuTe-DSL kernels with regular PyTorch
+operations and is therefore a correctness reference rather than a performance
+implementation.
+"""
+
 from __future__ import annotations
 
 import math
@@ -38,11 +56,13 @@ def _round_up(a: int, b: int) -> int:
 
 
 def _chunk_bound(num_items: int, total: int, chunk_size: int) -> int:
+    """Mirror FlashInfer ``varlen_helper.py::chunk_bound_host``."""
     m = min(num_items, total)
     return m + (total - m) // chunk_size
 
 
 def _workspace_num_chunks(num_seqs: int, total: int, chunk_size: int) -> int:
+    """Mirror FlashInfer ``varlen_helper.py::workspace_num_chunks_host``."""
     return _chunk_bound(num_seqs, total, chunk_size)
 
 
@@ -75,6 +95,12 @@ def _choose_cp_chunk_len(
     device: torch.device,
     granularity: int,
 ) -> int:
+    """PyTorch equivalent of ``varlen_helper.py::choose_cp_chunk_len_host``.
+
+    The same one-wave MN-precompute target and SM120 short-workload balancing
+    rule are retained. CPU execution uses a one-SM stand-in solely so this
+    reference remains independently runnable.
+    """
     if granularity <= 0 or granularity % BLOCK_SIZE != 0:
         raise ValueError(
             f"cp_chunk_len_granularity must be a positive multiple of {BLOCK_SIZE}"
@@ -227,6 +253,12 @@ def _compute_t_block(
     beta_sh: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Build one 64-token T block in FlashInfer's stored orientation.
+
+    Corresponds to ``CPDeltaRuleTPrecomputeSm120``. FlashInfer stores the
+    transposed negative beta-folded inverse in the Q/K dtype; retaining that
+    representation is important for matching the later MN and prefill stages.
+    """
     k_hsk = k_shk.transpose(0, 1).float()
     beta_hs1 = beta_sh.transpose(0, 1).unsqueeze(-1).float()
     ikk = _identity_add_strict_lower(
@@ -251,6 +283,11 @@ def torch_cp_delta_rule_t_precompute_sm120(
     *,
     num_sab_heads: Optional[int] = None,
 ) -> torch.Tensor:
+    """PyTorch stage 1 matching ``CPDeltaRuleTPrecomputeSm120``.
+
+    The returned workspace uses FlashInfer's compact packed-varlen block slots:
+    ``[workspace_64_blocks, num_sab_heads, 64, 64]``.
+    """
     del max_seqlen
     offsets, seq_lens = _seq_metadata(cu_seqlens, total_seqlen)
     if k.ndim != 3 or k.shape[0] != total_seqlen or k.shape[2] != HEAD_SIZE:
@@ -299,6 +336,11 @@ def _compute_cp_chunk_affine_transposed(
     alpha: torch.Tensor,
     t_blocks: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compose 64-token transforms as ``H_out = H_in @ M + N``.
+
+    ``M`` and ``N`` are kept in the transposed ``[V, K]`` workspace orientation
+    used by FlashInfer's SM120 MN and fixup kernels.
+    """
     num_heads = k.shape[1]
     eye = torch.eye(HEAD_SIZE, dtype=torch.float32, device=k.device).expand(
         num_heads, HEAD_SIZE, HEAD_SIZE
@@ -350,6 +392,13 @@ def torch_cp_delta_rule_mn_precompute_sm120(
     *,
     num_sab_heads: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch stage 2 matching ``CPDeltaRuleMNPrecomputeSm120``.
+
+    Multiple mathematical 64-token blocks are composed into one affine
+    transform for each ``cp_chunk_len`` chunk. The two returned FP32 tensors
+    correspond to FlashInfer's local transfer ``M`` and local state ``N``
+    workspaces.
+    """
     del max_seqlen
     if cp_chunk_len <= 0 or cp_chunk_len % BLOCK_SIZE != 0:
         raise ValueError(f"cp_chunk_len must be a positive multiple of {BLOCK_SIZE}")
@@ -438,6 +487,14 @@ def torch_cp_delta_rule_fixup_sm120(
     initial_state: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch stage 3 matching FlashInfer's SM120 fixup kernels.
+
+    This is the algorithmic equivalent of both
+    ``CPDeltaRuleFixupHmmaSm120`` and ``CPDeltaRuleFixupSimtSm120``. PyTorch
+    FP32 matmul replaces the kernel's HMMA/TF32 or SIMT implementation.
+    ``fixed_state[slot]`` is the state after that CP chunk; stage 4 reads the
+    previous slot as the next chunk's input state.
+    """
     offsets, seq_lens = _seq_metadata(cu_seqlens, total_seqlen)
     num_seqs = len(seq_lens)
     num_heads = local_transfer.shape[1]
@@ -469,6 +526,11 @@ def _run_main_block(
     state_v_k: torch.Tensor,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute one 64-token recurrence block from precomputed T.
+
+    This follows the block mathematics fused into
+    ``CPDeltaRulePrefillSm120`` rather than replaying the token recurrence.
+    """
     valid_len = q.shape[0]
     q_block = _pad_block(q, valid_len, fill_value=0)
     k_block = _pad_block(k, valid_len, fill_value=0)
@@ -531,6 +593,12 @@ def torch_cp_delta_rule_prefill_sm120(
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
 ) -> torch.Tensor:
+    """PyTorch stage 4 matching ``CPDeltaRulePrefillSm120``.
+
+    It consumes stage-1 ``T`` and stage-3 fixed boundary states, reconstructs
+    outputs blockwise, writes optional checkpoints, and stores final states in
+    FlashInfer's public ``[N, H, V, K]`` layout.
+    """
     del max_seqlen
     offsets, seq_lens = _seq_metadata(cu_seqlens, total_seqlen)
     num_heads = o.shape[1]
@@ -637,6 +705,13 @@ def torch_cp_delta_rule_sm120(
     cp_chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
     return_intermediates: bool = False,
 ) -> Optional[TorchGDNCPIntermediates]:
+    """Run the four-stage PyTorch mirror of ``cp_delta_rule_dsl_sm120``.
+
+    The argument order and tensor contracts intentionally track FlashInfer's
+    low-level SM120 entry point so callers can execute both implementations
+    with the same inputs. ``return_intermediates`` is reference-only and
+    exposes the workspaces for stage-by-stage comparison.
+    """
     total_seqlen, _, _, _ = _validate_qkv(q, k, v, alpha, beta, o)
     offsets, seq_lens = _seq_metadata(cu_seqlens, total_seqlen)
     num_seqs = len(seq_lens)
@@ -741,6 +816,14 @@ def torch_chunk_gated_delta_rule_cp_sm120(
     _cp_chunk_len: Optional[int] = None,
     backend: Literal["auto", "flashinfer"] = "flashinfer",
 ):
+    """Public adapter corresponding to ``gdn_prefill.py::chunk_gated_delta_rule``.
+
+    This standalone variant intentionally implements only the forced SM120
+    context-parallel FlashInfer route. Parameter names, defaults, packed
+    Q/K/V layout, indexed state-pool behavior, checkpoints, and return shape
+    follow the FlashInfer public API. Here ``g`` is FlashInfer's decay factor
+    ``alpha`` rather than a model-level log-decay value.
+    """
     if cu_seqlens is None:
         raise ValueError("cu_seqlens is required")
     if use_cp is not True:
